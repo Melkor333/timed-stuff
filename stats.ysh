@@ -1,0 +1,127 @@
+#!/usr/bin/env ysh
+
+# TODO: parse toml used for https://github.com/adfinis/timedctl
+const client_id = CLIENT_ID
+const auth_url = AUTH_URL
+const timed_url = TIMED_URL
+
+# TODO: use LeftMatch and pos
+#func deslug (slug) {
+#  var elems = {}
+#  var Sep = / '&' /
+#  var reg = / <capture !['&?']+ > '=' <capture !['&?']+ > /
+#  while (slug ~ reg) {
+#    setvar elems[_match(1)] = _match(2)
+#    echo $[_match(0)]
+#  }
+#  return (elems)
+#}
+func deslug (slug) {
+  var x = $(echo $slug | cut -d"?" -f2 | tr '&' $'\n' | tr '=' ' ')
+  var out = {}
+  echo $x | while read -r line {
+    # Can have 3 elements because of the last line. therefore no 'for x,y in' ...
+    # last line is "key val HTTP/1.1\r"
+    var l = line => split(" ")
+    setvar out[l[0]] = l[1]
+  }
+  return (out)
+}
+
+func sluggify (elements dict) {
+  var slug = ""
+  var first = true
+  for k, v in (elements) {
+    if (first) {
+      setvar slug = slug ++ "?"
+      setvar first = false
+    } else {
+      setvar slug = slug ++ "&"
+    }
+    # TODO: HTML Escape
+    setvar slug = slug ++ str(k) ++ "=" ++ str(v)
+  }
+  return (slug)
+}
+
+proc c (url, type='GET';;...d) {
+  var arguments = []
+  if ('headers' in d) {
+    for key, value in (d.headers) {
+      call arguments->append("-H")
+      call arguments->append("'$key: $value'")
+    }
+  }
+  var slug = ""
+  if ('slug' in d) {
+    setvar slug = d.slug => sluggify()
+  }
+  if ('data' in d) {
+    if (type === "GET") { echo "Warning: GET with data" >&2 }
+    if ('type' in d and d.type === 'json') {
+      call arguments->append("-H")
+      call arguments->append("'Content-Type: application/json'")
+      call arguments->append("-d")
+      call arguments->append("'" ++ d.data => toJson() ++ "'")
+    } else {
+      for key, val in (d.data) {
+        call arguments->append("-d")
+        call arguments->append("$key=$val")
+      }
+    }
+  }
+  if ('args' in d) {
+    setvar arguments = arguments ++ d.args
+  }
+  echo curl -k -s --fail @arguments -X $type "${url}$slug">&2
+  command curl -k -s --fail @arguments -X $type "${url}$slug"
+}
+
+# Step 0, get informations
+c "${auth_url}.well-known/openid-configuration" | json read (&oauth_conf)
+
+# TODO: checking could be much more thorough.
+if (oauth_conf.grant_types_supported => indexOf('urn:ietf:params:oauth:grant-type:device_code') === -1) {
+  echo "device code not supported by oauth"
+  exit 1
+}
+
+c $[oauth_conf.device_authorization_endpoint] "POST" (data={client_id: client_id, scope: "openid"}) | json read (&device_code_data)
+
+# Step 1 ask for authorization:
+echo "trying to open: $[device_code_data.verification_uri_complete]"
+try { xdg-open $[device_code_data.verification_uri_complete] }
+
+while (true) {
+  var data = {
+    grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+    device_code: device_code_data.device_code,
+    client_id: client_id,
+  }
+  try { c $[oauth_conf.token_endpoint] POST (data=data) | json read (&token_data) }
+  if (_status === 0) {
+    break
+  } else {
+    echo $[_status]
+    sleep $[device_code_data.interval]
+  }
+}
+
+var timed_headers = {
+  Authorization: "bearer $[token_data.access_token]",
+  Accept: "application/vnd.api+json",
+}
+
+# TODO: The above token apparently isn't enough yet
+# TODO: Reverse libtimed, probably https://github.com/adfinis/libtimed/blob/main/src/libtimed/oidc.py
+#c ${timed_url}/api/v1/projects (headers=timed_headers, args=["--verbose"])
+
+# Magic to get token with SSO and "local webserver". Not required anymore
+#var close_tab = u'''
+#HTTP/1.1 200 OK\n\n
+#const redirect_url = 'http%3A%2F%2Flocalhost%3A5000%2Ftimedctl%2Fauth'
+#<body><script>window.close(``, `_parent`, ``);</script></body>
+#'''
+#var code = $(echo $close_tab |timeout 30 nc -lN 5000 | head -1)
+#= deslug($(echo $code | head -1 | awk '{ print $2 }' | tr '&' ' '))
+#var s = deslug (code)
